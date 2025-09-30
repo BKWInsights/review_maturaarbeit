@@ -4,6 +4,8 @@ from itertools import combinations
 import re
 import glob 
 import os
+from pathlib import Path
+from tqdm import tqdm
 
 
 
@@ -33,123 +35,100 @@ def group_distribution(df):
 def group_distribution_for_chi_test(df):
     return df.groupby(["Group", "Name", "Seed", "Club"], dropna=False).size().reset_index(name="Count")
 
-# Pairs of 2
-def count_pairs(df):
-    pair_counter = defaultdict(list)
-
-    for file_value, sub in df.groupby("File"):
+def count_combinations(df, k: int):
+    tracker = defaultdict(list)
+    for _, sub in df.groupby("File"):
         draw_nr = sub["draw_nr"].iat[0]
         if pd.isna(draw_nr):
-            draw_nr = str(file_value)
-        for _, group_df in sub.groupby("Group"):
-            players = list(group_df["Name"])
-            for combo in combinations(players, 2):
-                pair = tuple(sorted(combo))
-                pair_counter[pair].append(draw_nr)
-    
-    return pair_counter
+            # Debug
+            fname = sub["File"].iat[0] if "File" in sub.columns else "<unknown>"
+            print(f"[DEBUG] Skip group because draw_nr missing – File: {fname}")
+            continue  # skip if draw_nr missing
+        for _, g in sub.groupby("Group"):
+            players = [p for p in g["Name"] if pd.notna(p)]
+            if len(players) < k:
+                continue
+            for combo in combinations(sorted(players), k):
+                tracker[combo].append(int(draw_nr))
+    return tracker
+
 
 # Check if there are further, unused combinations
-def find_unpaired(df, pair_counter):
-    all_players = sorted(df["Name"].unique())
+def find_never_together(df, pair_counter):
+    player_draws = {p: set(sub["draw_nr"].dropna()) for p, sub in df.groupby("Name")}
+    all_players = sorted(df["Name"].dropna().unique())
     all_combos = set(combinations(all_players, 2))
-    never_together = all_combos - set(pair_counter.keys())
+    observed_pairs = set(pair_counter.keys())
+    never_together = []
+    infos = df.drop_duplicates(subset="Name")[["Name","Seed","Club"]].set_index("Name")
 
-    infos = df.drop_duplicates(subset="Name")[["Name", "Seed", "Club"]].set_index("Name")
+    for a,b in all_combos:
+        if player_draws[a] & player_draws[b]:  # were in same draw at least once
+            if (a,b) not in observed_pairs:
+                seed_a, seed_b = infos.loc[a,"Seed"], infos.loc[b,"Seed"]
+                club_a, club_b = infos.loc[a,"Club"], infos.loc[b,"Club"]
+                if pd.notna(seed_a) and pd.notna(seed_b): continue
+                if pd.notna(club_a) and pd.notna(club_b) and club_a==club_b: continue
+                never_together.append({
+                    "Player 1": a, "Seed 1": seed_a, "Club 1": club_a,
+                    "Player 2": b, "Seed 2": seed_b, "Club 2": club_b,
+                    "Count": 0
+                })
+    return pd.DataFrame(never_together)
 
-    rows = []
-    for a, b in never_together:
-        seed_a = infos.loc[a, "Seed"]
-        seed_b = infos.loc[b, "Seed"]
-        club_a = infos.loc[a, "Club"]
-        club_b = infos.loc[b, "Club"]
 
-        # If both are seeded or from the same club -> remove
-        if pd.notna(seed_a) and pd.notna(seed_b):
-            continue
-        if pd.notna(club_a) and pd.notna(club_b) and club_a == club_b:
-            continue
-
-        rows.append({
-            "Player 1": a,
-            "Seed 1": infos.loc[a, "Seed"],
-            "Club 1": infos.loc[a, "Club"],
-            "Player 2": b,
-            "Seed 2": infos.loc[b, "Seed"],
-            "Club 2": infos.loc[b, "Club"],
-            "Count": pair_counter.get((a, b), 0)
-        })
-    
-    return pd.DataFrame(rows)
-
-# Triplets (3)
-def count_triplets(df):
-    triplet_tracker = defaultdict(list)
-
-    for file_value, sub in df.groupby("File"):
-        draw_nr = sub["draw_nr"].iat[0]
-        if pd.isna(draw_nr):
-            draw_nr = str(file_value)
-        for _, group_df in sub.groupby("Group"):
-            players = list(group_df["Name"])
-            for combo in combinations(players, 3):
-                triple = tuple(sorted(combo))
-                triplet_tracker[triple].append(draw_nr)
-
-    return triplet_tracker
-
-# Quadruplets (4)
-def count_quadruplets(df):
-    quadruplets_tracker = defaultdict(list)
-
-    for file_value, sub in df.groupby("File"):
-        draw_nr = sub["draw_nr"].iat[0]
-        if pd.isna(draw_nr):
-            draw_nr = str(file_value)
-        for _, group_df in sub.groupby("Group"):
-            players = list(group_df["Name"])
-            for combo in combinations(players, 4):
-                quadruplets = tuple(sorted(combo))
-                quadruplets_tracker[quadruplets].append(draw_nr)
-
-    return quadruplets_tracker
 
 
 input_folder = r"D:\Maturaarbeit\all_MS_U13_parts"
 output_folder = r"D:\Maturaarbeit\evaluations"
 os.makedirs(output_folder, exist_ok=True)
 
-excel_files = glob.glob(os.path.join(input_folder, "*.xlsx"))
+def natkey(s): 
+    return [int(t) if t.isdigit() else t for t in re.split(r'(\d+)', s)]
 
-for file in excel_files:
-    print(f"Processing file: {os.path.basename(file)}")
+excel_files = sorted(glob.glob(os.path.join(input_folder, "*.xlsx")), key=natkey)
+
+
+
+
+# Main loop
+for file in tqdm(excel_files, desc="Processing files", ncols=100):
+    base_name = os.path.basename(file)
+    tqdm.write(f"Processing file: {base_name}")
 
     # Load prepared Excel
     df = pd.read_excel(file)
 
-     # Extract draw number
-    df["file_str"] = df["File"].astype(str)
+    # Extract draw number
     df["draw_nr"] = pd.to_numeric(
-        df["file_str"].str.extract(r"Ausl_(\d+)_", expand=False),
+        df["File"].astype(str)
+                .map(lambda p: Path(p).stem)           
+                .str.extract(r"(\d+)", expand=False), 
         errors="coerce"
     ).astype("Int64")
 
+    if df["draw_nr"].isna().any():
+        raise ValueError(
+            f"draw_nr could not be extracet in all files: {file}"
+        )
+
     dist = group_distribution(df)
-    pair_counter = count_pairs(df)
-    never_df = find_unpaired(df, pair_counter)
-    triplet_counter = count_triplets(df)
-    quadruplets_counter = count_quadruplets(df)
+    pair_counter = count_combinations(df, 2)
+    triplet_counter = count_combinations(df, 3)
+    quadruplets_counter = count_combinations(df, 4)
+    never_df = find_never_together(df, pair_counter)
+
     dist_chi_test = group_distribution_for_chi_test(df)
 
     # Convert pairs of 2 into DataFrame
     pair_df = pd.DataFrame([
         {"Player 1": a,
         "Player 2": b,
-        "Count": len(files),
-        "Max consecutive": longest_consecutive_run(files),
-        "Draw numbers": format_draw_display(files)
+        "Count": len(draws),
+        "Max consecutive": longest_consecutive_run(draws),
+        "Draw numbers": format_draw_display(draws)
         }
-        for (a, b), files in pair_counter.items()
+        for (a, b), draws in pair_counter.items()
     ])
     pair_df = pair_df.sort_values(by="Count", ascending=False)
 
@@ -159,11 +138,11 @@ for file in excel_files:
             "Player 1": a,
             "Player 2": b,
             "Player 3": c,
-            "Count": len(files),
-            "Max consecutive": longest_consecutive_run(files),
-            "Draw numbers": format_draw_display(files)
+            "Count": len(draws),
+            "Max consecutive": longest_consecutive_run(draws),
+            "Draw numbers": format_draw_display(draws)
         }
-        for (a, b, c), files in triplet_counter.items()
+        for (a, b, c), draws in triplet_counter.items()
     ])
     triplet_df = triplet_df.sort_values(by="Count", ascending=False)
 
@@ -174,11 +153,12 @@ for file in excel_files:
             "Player 2": b,
             "Player 3": c,
             "Player 4": d,
-            "Count": len(files),
-            "Max consecutive": longest_consecutive_run(files),
-            "Draw numbers": ", ".join(map(str, set(files)))
+            "Count": len(draws),
+            "Max consecutive": longest_consecutive_run(draws),
+            "Draw numbers": format_draw_display(draws)
+
         }
-        for (a, b, c, d), files in quadruplets_counter.items()
+        for (a, b, c, d), draws in quadruplets_counter.items()
     ])
     quadruplet_df = quadruplet_df.sort_values(by="Count", ascending=False)
 

@@ -1,7 +1,16 @@
 import pandas as pd
 import numpy as np
-from scipy.stats import chisquare, ttest_1samp, ttest_ind, f
-import math, random, glob, os
+from scipy.stats import chisquare
+from scipy.stats import beta as beta_dist, norm
+from scipy.stats import binomtest
+import math, random, glob, os, re
+
+
+rng = np.random.default_rng(seed=42)
+random.seed(42)
+n_boot = 10000
+
+
 # from vergleichsbasis_random import monte_carlo_random, get_full_slots
 
 # Folder with all evaluation files
@@ -12,14 +21,38 @@ output_folder = r"D:\Maturaarbeit\analysis_results"
 os.makedirs(output_folder, exist_ok=True)
 
 # Collect all Excel files
-excel_files = glob.glob(os.path.join(input_folder, "*.xlsx"))
+def sort_key(s):
+    # split string in text and number blocks
+    return [int(text) if text.isdigit() else text.lower() for text in re.split('([0-9]+)', s)]
+
+excel_files = sorted(glob.glob(os.path.join(input_folder, "*.xlsx")), key=sort_key)
+
+def wilson_interval(x, n, alpha=0.05):
+    if n == 0:
+        return (0.0, 0.0)
+    p_hat = x / n
+    z = norm.ppf(1 - alpha/2) 
+    denom = 1 + z*z/n
+    center = (p_hat + z*z/(2*n)) / denom
+    half = (z/denom) * math.sqrt(p_hat*(1-p_hat)/n + z*z/(4*n*n))
+    return max(0.0, center - half), min(1.0, center + half)
+
+def jeffreys_interval(x, n, alpha=0.05):
+    if n == 0:
+        return (0.0, 0.0)
+    a = x + 0.5
+    b = n - x + 0.5
+    lo = 0.0 if x == 0 else float(beta_dist.ppf(alpha/2, a, b))
+    hi = 1.0 if x == n else float(beta_dist.ppf(1 - alpha/2, a, b))
+    return lo, hi
+
 
 for file in excel_files:
     print(f"Processing: {os.path.basename(file)}")
 
     # Load 6th sheet
     try:
-        df_all = pd.read_excel(file, sheet_name=5, engine="openpyxl")
+        df_all = pd.read_excel(file, sheet_name="Chi2 preparation", engine="openpyxl")
     except Exception as e:
         print(f"Skipping {file}, error reading sheet: {e}")
         continue
@@ -73,7 +106,8 @@ for file in excel_files:
     )
 
     # Clubs per player
-    clubs = df_all.set_index("Name")["Club"].to_dict()
+    clubs = df_all.groupby("Name")["Club"].agg(
+    lambda s: s.mode().iat[0] if not s.mode().empty else "UNKNOWN").to_dict()
 
     # Create seed map
     seed_map = {
@@ -82,7 +116,7 @@ for file in excel_files:
         for name in grouped.index
     }
 
-    # Helper function: allowed groups by seed
+    # allowed groups for seeded players
     def seed_allowed_groups(seed, groups):
         if seed == 1:
             return ["A"]
@@ -94,7 +128,7 @@ for file in excel_files:
             return ["E", "F", "G", "H"]
         return groups
 
-    # Monte Carlo with MRV (slightly shortened)
+    # Monte Carlo with MRV
     def monte_carlo_mrv(seed_map, free_slots, clubs, n_sim, max_restarts=50):
         groups = list(free_slots.keys())
         def seed_allowed_groups(seed):
@@ -189,7 +223,7 @@ for file in excel_files:
                     success = True
                     break
 
-            # MUST CHANGE
+
             if not success:
                 # fallback
                 print(f"simulation {sim} has softer rules.")
@@ -209,10 +243,13 @@ for file in excel_files:
                     gclubs[chosen].add(clubs[p])
                     rows.append({"Player": p, "Group": chosen, "Simulation": sim})
         return pd.DataFrame(rows)
+        # Fallback never happend during testing
+
 
     # Main loop
-    total_draws = df_all["Count"].sum() / df_all["Name"].nunique()
-    n_sim = int(total_draws)
+    counts_per_player = df_all.groupby("Name")["Count"].sum()
+    n_sim = int(counts_per_player.median())
+
     detail_rows = []
     summary_rows = []
 
@@ -227,23 +264,72 @@ for file in excel_files:
     #counts_random = df_all_sims_random.groupby(["Player", "Group"]).size().unstack(fill_value=0)
     #probabilities_random = counts_random / n_sim
 
+
+    # Monte-Carlo 95 % confidence intervals
+    if os.path.basename(file) == "evaluation_all_MS_U13.xlsx":
+        n_series = 1
+        sim_per_series = 10000
+    else:
+        n_series = 50 # to have enough samples
+        sim_per_series = 200
+
+    series_count = []
+
+    for s in range(n_series):
+        # Simulate sim_per_series Tournaments
+        df_sim_subset = monte_carlo_mrv(seed_map, free_slots, clubs, sim_per_series)
+
+        # Count per player per group, how much in each series
+        counts_subset = (
+            df_sim_subset
+            .groupby(["Player", "Group"])
+            .size()
+            .unstack(fill_value=0)
+        )
+        series_count.append(counts_subset)
+
+    # all series together
+    all_series = pd.concat(series_count, keys=range(n_series), names=["Series", "Player"])
+
+    # Calculate quantiles for min/max
+    lower_mc_counts = all_series.groupby("Player").quantile(0.025)
+    upper_mc_counts = all_series.groupby("Player").quantile(0.975)
+
     for player in grouped.index:
         counts_obs = grouped.loc[player].values
         total = counts_obs.sum()
         seed_vals = df_all.loc[df_all["Name"] == player, "Seed"].dropna().unique()
         seed_norm = parser_seed(seed_vals[0]) if len(seed_vals) else None
         expected_exact = np.array(expected_distribution(total, seed_norm, all_groups, p_unseeded))
-        if seed_norm not in [1, 2, "3/4", "5/8"]:
+        if seed_norm  in [1, 2, "3/4", "5/8"]:
+            # # deterministic expectation, no simulation needed
+            for i, g in enumerate(all_groups):
+                    detail_rows.append({
+                        "Player": player,
+                        "Seed": seed_norm,
+                        "Group": g,
+                        "Observed": counts_obs[i],
+                        "Expected_exact": expected_exact[i],
+                        "Note": "deterministic"
+                    })
+            summary_rows.append({
+                "Player": player,
+                "Seed": seed_norm,
+                "Total": int(total),
+                "Chi2_theoretical": None,
+                "p_theoretical": None,
+                "Note": "deterministic"
+            })            
+        else:
             expected_sim = probabilities_all.loc[player].values
             var_sim = expected_sim * (1 - expected_sim)
             std_sim = np.sqrt(var_sim)
-            counts_per_group = np.random.binomial(
-                n=total,
-                p=expected_sim,
-                size=(n_sim, len(all_groups))
-            )
-            lower = np.percentile(counts_per_group, 2.5, axis=0)
-            upper = np.percentile(counts_per_group, 97.5, axis=0)
+            
+            sim_counts = rng.multinomial(int(total), expected_sim, size=n_boot)
+
+            lower = np.percentile(sim_counts, 2.5, axis=0)
+            upper = np.percentile(sim_counts, 97.5, axis=0)
+
             mask = expected_exact > 0
             chi2_theo, p_theo = chisquare(f_obs=counts_obs[mask], f_exp=expected_exact[mask])
             k = mask.sum()
@@ -267,22 +353,19 @@ for file in excel_files:
 
             for i, g in enumerate(all_groups):
                 # Simulation results for this group
-                sim_counts = counts_per_group[:, i]  # from the existing simulation
+                sim_counts_group = sim_counts[:, i] 
 
-                # t-test: checks if the mean of the simulation = observed value
-                t_stat, p_t = ttest_1samp(sim_counts, counts_obs[i])
+                p_value_binom = binomtest(
+                    k=int(counts_obs[i]),
+                    n=int(total),
+                    p=float(expected_sim[i])
+                ).pvalue
 
-                # F-test: checks if the variance of the simulation = variance of the observation
-                # (here as ratio of variances; observation is only 1 value, so modeled as deviation from expected value)
-                var_sim_i = np.var(sim_counts, ddof=1)
-                var_obs_i = (counts_obs[i] - expected_sim_counts[i])**2  # squared deviation as "variance" for 1 observation
-                f_stat = var_sim_i / (var_obs_i if var_obs_i != 0 else 1e-10)
-
-                # p-value for F-test (two-sided)
-                dfn = len(sim_counts) - 1
-                dfd = 1  # observation = 1 value
-                p_f = 2 * min(f.cdf(f_stat, dfn, dfd), 1 - f.cdf(f_stat, dfn, dfd))
                 
+                 # Wilson and Jeffreys CI for observed portion
+                wilson_lo, wilson_hi = wilson_interval(counts_obs[i], total)
+                jeff_lo, jeff_hi = jeffreys_interval(counts_obs[i], total)
+
                 detail_rows.append({
                     "Player": player,
                     "Seed": seed_norm,
@@ -293,32 +376,29 @@ for file in excel_files:
                     "Expected_simulated": expected_sim_counts[i],
                     "Variance_simulated": var_sim[i],
                     "Std_simulated": std_sim[i],
-                    "95%_min": int(lower[i]),
-                    "95%_max": int(upper[i]),
+                    "95%_min_binom": int(lower[i]),
+                    "95%_max_binom": int(upper[i]),
+                    "95%_min_mc": int(lower_mc_counts.loc[player, g]),
+                    "95%_max_mc": int(upper_mc_counts.loc[player, g]),
+                    "Wilson_low": wilson_lo,
+                    "Wilson_high": wilson_hi,
+                    "Jeffreys_low": jeff_lo,
+                    "Jeffreys_high": jeff_hi,
                     "Within": "Yes" if lower[i] <= counts_obs[i] <= upper[i] else "No",
-                    "t_stat": t_stat,
-                    "p_t": p_t,
-                    "f_stat": f_stat
+                    "p_binom": p_value_binom
                 })
             yes_count = sum(lower[i] <= counts_obs[i] <= upper[i] for i in range(len(all_groups)))
             pct_in = yes_count / len(all_groups) * 100
 
-            # t- and F-test against the theoretical expectation
-            # Observed frequencies in all groups
-            obs_count = counts_obs.astype(float)
-            # Expected frequencies (theoretical)
-            exp_counts = expected_exact.astype(float)
-
-            # F-test: variance comparison
-            var_obs = np.var(obs_count, ddof=1)
-            var_exp = np.var(exp_counts, ddof=1)
-            if var_obs > var_exp:
-                f_stat = var_obs / var_exp
-                dfn, dfd = len(obs_count) - 1, len(exp_counts) - 1
-            else:
-                f_stat = var_exp / var_obs
-                dfn, dfd = len(exp_counts) - 1, len(obs_count) - 1
-            p_f = 2 * min(f.cdf(f_stat, dfn, dfd), 1 - f.cdf(f_stat, dfn, dfd))
+            # smallest binom p value
+            min_binom_p = min(
+                binomtest(
+                    k=int(counts_obs[i]),
+                    n=int(total),
+                    p=float(expected_sim[i])
+                ).pvalue
+                for i in range(len(all_groups))
+            )
 
             summary_rows.append({
                 "Player": player,
@@ -332,15 +412,14 @@ for file in excel_files:
                 "CramersV_simulated": cramers_sim,
                 "Variance_simulated_avg": var_sim.mean(),
                 "Within_95%": pct_in,
-                "f_stat": f_stat,
-                "p_f": p_f
+                "min_p_binom": min_binom_p
             })
 
     # Export
     df_detail = pd.DataFrame(detail_rows)
     df_summary = pd.DataFrame(summary_rows)
 
-    # Generateoutput file path
+    # Generate output file path
     base_name = os.path.splitext(os.path.basename(file))[0]
     output_file = os.path.join(output_folder, f"analysis_{base_name}.xlsx")
 
